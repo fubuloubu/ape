@@ -540,6 +540,17 @@ def test_get_contract(project_with_contracts):
     assert isinstance(actual, ContractContainer)
     assert actual.contract_type.name == "Other"
 
+    # Ensure manifest is only loaded once by none-ing out the path.
+    # Otherwise, this can be a MAJOR performance hit.
+    manifest_path = project_with_contracts.manifest_path
+    project_with_contracts.manifest_path = None
+    try:
+        actual = project_with_contracts.get_contract("Other")
+        assert isinstance(actual, ContractContainer)
+        assert actual.contract_type.name == "Other"
+    finally:
+        project_with_contracts.manifest_path = manifest_path
+
 
 def test_get_contract_not_exists(project):
     actual = project.get_contract("this is not a contract")
@@ -600,6 +611,12 @@ class TestProject:
 
         # Also, show it got set on the manifest.
         assert project.manifest.contract_types == {contract_type.name: contract_type}
+
+    def test_from_python_library(self):
+        # web3py as an ape-project dependency.
+        web3 = Project.from_python_library("web3")
+        assert "site-packages" in str(web3.path)
+        assert web3.path.name == "web3"
 
 
 class TestBrownieProject:
