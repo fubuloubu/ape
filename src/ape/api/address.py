@@ -1,8 +1,6 @@
 from abc import abstractmethod
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
-
-from eth_pydantic_types import HexBytes
+from typing import TYPE_CHECKING, Any, Optional
 
 from ape.exceptions import AccountsError, ConversionError
 from ape.types.address import AddressType
@@ -170,16 +168,33 @@ class BaseAddress(BaseInterface):
         """
         The number of bytes in the smart contract.
         """
-
-        return len(self.code)
+        code = self.code
+        return len(code) if isinstance(code, bytes) else len(bytes.fromhex(code.lstrip("0x")))
 
     @property
     def is_contract(self) -> bool:
         """
         ``True`` when there is code associated with the address.
         """
+        return self.codesize > 0
 
-        return len(HexBytes(self.code)) > 0
+    @property
+    def delegate(self) -> Optional["BaseAddress"]:
+        """
+        Check and see if Account has a "delegate" contract, which is a contract that this account
+        delegates functionality to. This could be from many contexts, such as a Smart Wallet like
+        Safe (https://github.com/ApeWorX/ape-safe) which has a Singleton class it forwards to, or
+        an EOA using an EIP7702-style delegate. Returning ``None`` means that the account does not
+        have a delegate.
+
+        The default behavior is to use `:class:~ape.managers.ChainManager.get_delegate` to check if
+        the account has a proxy, such as ``SafeProxy`` for ``ape-safe`` or an EIP7702 delegate.
+
+        Returns:
+            Optional[`:class:~ape.contracts.ContractInstance`]:
+                The contract instance of the delegate contract (if available).
+        """
+        return self.chain_manager.get_delegate(self.address)
 
     @cached_property
     def history(self) -> "AccountHistory":
@@ -189,16 +204,23 @@ class BaseAddress(BaseInterface):
         return self.chain_manager.history[self.address]
 
     def as_transaction(self, **kwargs) -> "TransactionAPI":
+        sign = kwargs.pop("sign", False)
         converted_kwargs = self.conversion_manager.convert_method_kwargs(kwargs)
-        return self.provider.network.ecosystem.create_transaction(
+        tx = self.provider.network.ecosystem.create_transaction(
             receiver=self.address, **converted_kwargs
         )
+        if sender := kwargs.get("sender"):
+            if hasattr(sender, "prepare_transaction"):
+                prepared = sender.prepare_transaction(tx)
+                return (sender.sign_transaction(prepared) or prepared) if sign else prepared
+
+        return tx
 
     def estimate_gas_cost(self, **kwargs) -> int:
         txn = self.as_transaction(**kwargs)
         return self.provider.estimate_gas_cost(txn)
 
-    def prepare_transaction(self, txn: "TransactionAPI") -> "TransactionAPI":
+    def prepare_transaction(self, txn: "TransactionAPI", **kwargs) -> "TransactionAPI":
         """
         Set default values on a transaction.
 
@@ -209,6 +231,7 @@ class BaseAddress(BaseInterface):
 
         Args:
             txn (:class:`~ape.api.transactions.TransactionAPI`): The transaction to prepare.
+            **kwargs: Sub-classes, such as :class:`~ape.api.accounts.AccountAPI`, use additional kwargs.
 
         Returns:
             :class:`~ape.api.transactions.TransactionAPI`
@@ -234,6 +257,7 @@ class BaseAddress(BaseInterface):
                 f"(transfer_value={txn.total_transfer_value}, balance={self.balance})."
             )
 
+        txn.sender = txn.sender or self.address
         return txn
 
 

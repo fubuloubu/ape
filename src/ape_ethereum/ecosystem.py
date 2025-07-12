@@ -70,6 +70,7 @@ from ape_ethereum.transactions import (
     BaseTransaction,
     DynamicFeeTransaction,
     Receipt,
+    SetCodeTransaction,
     SharedBlobReceipt,
     SharedBlobTransaction,
     StaticFeeTransaction,
@@ -435,8 +436,12 @@ class Ethereum(EcosystemAPI):
 
         if tx_type is TransactionType.STATIC:
             return StaticFeeTransaction
+
         elif tx_type is TransactionType.ACCESS_LIST:
             return AccessListTransaction
+
+        elif tx_type is TransactionType.SET_CODE:
+            return SetCodeTransaction
 
         return DynamicFeeTransaction
 
@@ -447,7 +452,7 @@ class Ethereum(EcosystemAPI):
         bytes_obj = contract_type.deployment_bytecode
         contract_bytes = (bytes_obj.to_bytes() or b"") if bytes_obj else b""
         header = kwargs.pop("header", BLUEPRINT_HEADER)
-        blueprint_bytecode = header + HexBytes(0) + contract_bytes
+        blueprint_bytecode = header + b"\x00" + contract_bytes
         len_bytes = len(blueprint_bytecode).to_bytes(2, "big")
         return_data_size = kwargs.pop("return_data_size", HexBytes("0x61"))
         return_instructions = kwargs.pop("return_instructions", HexBytes("0x3d81600a3d39f3"))
@@ -479,6 +484,7 @@ class Ethereum(EcosystemAPI):
             ProxyType.SoladyCWIA: r"36602c57343d527f9e4ac34f21c619cefc926c8bd93b54bf5a39c7ab2127a895af1cc0691d7e3dff593da1005b363d3d373d3d3d3d61.{4}806062363936013d73(.{40})5af43d3d93803e606057fd5bf3.*",
             ProxyType.SplitsCWIA: r"36602f57343d527f9e4ac34f21c619cefc926c8bd93b54bf5a39c7ab2127a895af1cc0691d7e3dff60203da13d3df35b3d3d3d3d363d3d3761.{4}606736393661.{4}013d73(.{40})5af43d3d93803e606557fd5bf3.*",
             ProxyType.SoladyPush0: r"^5f5f365f5f37365f73(.{40})5af43d5f5f3e6029573d5ffd5b3d5ff3",
+            ProxyType.SetCode: r"^ef0100(.{40})$",
         }
         for type_, pattern in patterns.items():
             if match := re.match(pattern, code):
@@ -898,6 +904,7 @@ class Ethereum(EcosystemAPI):
             TransactionType.ACCESS_LIST: AccessListTransaction,
             TransactionType.DYNAMIC: DynamicFeeTransaction,
             TransactionType.SHARED_BLOB: SharedBlobTransaction,
+            TransactionType.SET_CODE: SetCodeTransaction,
         }
         if "type" in tx_data:
             # May be None in data.
@@ -912,14 +919,17 @@ class Ethereum(EcosystemAPI):
                 # Using hex values or alike.
                 version = TransactionType(self.conversion_manager.convert(tx_data["type"], int))
 
-        elif "gas_price" in tx_data:
-            version = TransactionType.STATIC
+        # NOTE: Determine these in reverse order
+        elif "authorizationList" in tx_data:
+            version = TransactionType.SET_CODE
+        elif "maxFeePerBlobGas" in tx_data or "blobVersionedHashes" in tx_data:
+            version = TransactionType.SHARED_BLOB
         elif "max_fee" in tx_data or "max_priority_fee" in tx_data:
             version = TransactionType.DYNAMIC
         elif "access_list" in tx_data or "accessList" in tx_data:
             version = TransactionType.ACCESS_LIST
-        elif "maxFeePerBlobGas" in tx_data or "blobVersionedHashes" in tx_data:
-            version = TransactionType.SHARED_BLOB
+        elif "gas_price" in tx_data:
+            version = TransactionType.STATIC
         else:
             version = self.default_transaction_type
 

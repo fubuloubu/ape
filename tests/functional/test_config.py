@@ -161,7 +161,7 @@ def test_model_validate_handles_environment_variables():
         NetworkConfig, "required_confirmations", "APE_ETHEREUM_REQUIRED_CONFIRMATIONS", "6498", 6498
     )
     run_test(EthereumNetworkConfig, "mainnet", "APE_NODE_MAINNET", '{"a":"b"}', {"a": "b"})
-    run_test(EthereumNodeConfig, "executable", "APE_NODE_EXECUTABLE", "40613177e494")
+    run_test(EthereumNodeConfig, "executable", "APE_NODE_EXECUTABLE", "geth", expected=["geth"])
     run_test(CoverageReportsConfig, "terminal", "APE_TEST_TERMINAL", "false", False)
     run_test(GasConfig, "reports", "APE_TEST_REPORTS", '["terminal"]', ["terminal"])
     run_test(GasExclusion, "method_name", "APE_TEST_METHOD_NAME", "32aa54e3c5d2")
@@ -278,11 +278,11 @@ def test_validate_file_uses_project_name():
         assert cfg.name == name
 
 
-def test_deployments(networks_connected_to_tester, owner, vyper_contract_container, project):
+def test_deployments(networks_connected_to_tester, owner, project):
     _ = networks_connected_to_tester  # Connection needs to lookup config.
 
     # First, obtain a "previously-deployed" contract.
-    instance = vyper_contract_container.deploy(1000200000, sender=owner)
+    instance = project.VyperContract.deploy(1000200000, sender=owner)
     address = instance.address
 
     # Create a config using this new contract for a "later time".
@@ -292,7 +292,7 @@ def test_deployments(networks_connected_to_tester, owner, vyper_contract_contain
     with project.temp_config(deployments=deploys):
         deploy_config = project.config.deployments
         assert deploy_config["ethereum"]["local"][0]["address"] == address
-        deployment = vyper_contract_container.deployments[0]
+        deployment = project.VyperContract.deployments[0]
 
     assert deployment.address == instance.address
 
@@ -587,9 +587,26 @@ def test_config_enum():
     assert actual.my_enum == MyEnum.FOO
 
 
+def test_contracts_folder(project):
+    with project.temp_config(**{"contracts_folder": "src"}):
+        assert project.contracts_folder.name == "src"
+
+
 def test_contracts_folder_with_hyphen(project):
     with project.temp_config(**{"contracts-folder": "src"}):
         assert project.contracts_folder.name == "src"
+
+
+def test_contracts_folder_invalid(project):
+    """
+    Show that we can still attempt to use `.get_config()` when config is invalid.
+    """
+    with pytest.raises(ConfigError):
+        with project.temp_config(**{"contracts_folder": {}}):
+            _ = project.contracts_folder
+
+    # Ensure config is fine _after_ something invalid.
+    assert project.contracts_folder
 
 
 def test_custom_network():

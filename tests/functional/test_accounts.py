@@ -1,10 +1,11 @@
 from os import environ
 
 import pytest
-from eip712.messages import EIP712Message
+from cchecksum import to_checksum_address
+from eip712.messages import EIP712Message, EIP712Type
 from eth_account.messages import encode_defunct
 from eth_pydantic_types import HexBytes
-from eth_utils import to_hex
+from eth_utils import keccak, to_hex
 from ethpm_types import ContractType
 
 import ape
@@ -13,6 +14,7 @@ from ape.contracts import ContractContainer
 from ape.exceptions import (
     AccountsError,
     AliasAlreadyInUseError,
+    MethodNonPayableError,
     MissingDeploymentBytecodeError,
     NetworkError,
     ProjectError,
@@ -23,6 +25,7 @@ from ape.types.signatures import recover_signer
 from ape.utils.testing import DEFAULT_TEST_MNEMONIC
 from ape_accounts.accounts import (
     KeyfileAccount,
+    _get_signing_message_with_display,
     generate_account,
     import_account_from_mnemonic,
     import_account_from_private_key,
@@ -61,9 +64,14 @@ def message():
     return encode_defunct(text="Hello Apes!")
 
 
+class Baz(EIP712Type):
+    addr: "address"  # type: ignore  # noqa: F821
+
+
 class Foo(EIP712Message):
     _name_: "string" = "Foo"  # type: ignore  # noqa: F821
     bar: "address"  # type: ignore  # noqa: F821
+    baz: Baz
 
 
 def test_sign_message(signer, message):
@@ -112,7 +120,8 @@ def test_recover_signer(signer, message):
 
 
 def test_sign_eip712_message(signer):
-    foo = Foo(signer.address)  # type: ignore[call-arg]
+    baz = Baz(addr=signer.address)  # type: ignore[call-arg]
+    foo = Foo(bar=signer.address, baz=baz)  # type: ignore[call-arg]
     signature = signer.sign_message(foo)
     assert signer.check_signature(foo, signature)
 
@@ -132,6 +141,23 @@ def test_sign_message_with_prompts(runner, keyfile_account, message):
     # Nonce should not change from signing messages.
     end_nonce = keyfile_account.nonce
     assert start_nonce == end_nonce
+
+
+def test_sign_eip712_message_shows_custom_types(signer):
+    baz = Baz(addr=signer.address)  # type: ignore[call-arg]
+    foo = Foo(bar=signer.address, baz=baz)  # type: ignore[call-arg]
+    display_msg, msg = _get_signing_message_with_display(foo)
+    expected = """
+Signing EIP712 Message
+Domain
+  Name: Foo
+Message
+  bar: 0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc
+  baz:
+    addr: 0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc
+""".strip()
+    assert display_msg
+    assert display_msg.strip() == expected
 
 
 def test_sign_raw_hash(runner, keyfile_account):
@@ -329,9 +355,9 @@ def test_deploy_and_not_publish(
     assert not mock_explorer.call_count
 
 
-def test_deploy_proxy(owner, vyper_contract_instance, proxy_contract_container, chain):
+def test_deploy_proxy(owner, vyper_contract_instance, project, chain):
     target = vyper_contract_instance.address
-    proxy = owner.deploy(proxy_contract_container, target)
+    proxy = owner.deploy(project.SimpleProxy, target)
 
     # Ensure we can call both proxy and target methods on it.
     assert proxy.implementation  # No attr err
@@ -391,10 +417,19 @@ def test_deploy_no_deployment_bytecode(owner, bytecode):
         owner.deploy(contract)
 
 
-def test_deploy_contract_type(owner, vyper_contract_type, clean_contract_caches):
-    contract = owner.deploy(vyper_contract_type, 0)
+def test_deploy_contract_type(owner, project, clean_contract_caches):
+    contract_type = project.VyperContract.contract_type
+    contract = owner.deploy(contract_type, 0)
     assert contract.address
     assert contract.txn_hash
+
+
+def test_deploy_sending_funds_to_non_payable_constructor(project, owner):
+    with pytest.raises(
+        MethodNonPayableError,
+        match=r"Sending funds to a non-payable constructor\.",
+    ):
+        owner.deploy(project.SolidityContract, 1, value="1 ether")
 
 
 def test_send_transaction_with_bad_nonce(sender, receiver):
@@ -681,10 +716,15 @@ def test_dir(core_account):
         "alias",
         "balance",
         "call",
+        "delegate",
+        "delegate_to",
         "deploy",
         "nonce",
         "prepare_transaction",
         "provider",
+        "remove_delegate",
+        "set_delegate",
+        "sign_authorization",
         "sign_message",
         "sign_transaction",
         "transfer",
@@ -747,6 +787,20 @@ def test_iter_test_accounts(accounts):
 def test_declare(contract_container, sender):
     receipt = sender.declare(contract_container)
     assert not receipt.failed
+
+
+def test_prepare_transaction(ethereum, sender):
+    tx = ethereum.create_transaction()
+    prepared_tx = sender.prepare_transaction(tx)
+    assert prepared_tx.sender == sender.address
+    assert prepared_tx.signature is None
+
+
+def test_prepare_transaction_sign(sender, ethereum):
+    tx = ethereum.create_transaction()
+    prepared_tx = sender.prepare_transaction(tx, sign=True)
+    assert prepared_tx.sender == sender.address
+    assert prepared_tx.signature is not None
 
 
 @pytest.mark.parametrize("tx_type", (TransactionType.STATIC, TransactionType.DYNAMIC))
@@ -818,9 +872,31 @@ def test_prepare_transaction_and_call_using_max_gas(tx_type, ethereum, sender, e
     assert not actual.failed
 
 
-def test_public_key(runner, keyfile_account):
+def test_authorizations_transaction(sender, vyper_contract_instance):
+    assert not sender.delegate
+
+    # NOTE: 0x23fd0e40 is method_id for `myNumber()`
+    # NOTE: Must call something, since `__default__` raises
+    with sender.delegate_to(vyper_contract_instance, data="0x23fd0e40") as delegate:
+        assert sender.delegate == vyper_contract_instance
+        assert delegate.myNumber() == 0
+
+    sender.remove_delegate()
+    assert not sender.delegate
+
+
+def test_public_key(runner, keyfile_account, owner):
     with runner.isolation(input=f"{PASSPHRASE}\ny\n"):
+        pub_key = keyfile_account.public_key
         assert isinstance(keyfile_account.public_key, HexBytes)
+
+        # Prove it is the correct public key by deriving the address.
+        derived_address = to_checksum_address(keccak(pub_key)[-20:])
+        assert derived_address == keyfile_account.address
+
+    # Also, show the test accounts have access to their public key.
+    derived_address = to_checksum_address(keccak(owner.public_key)[-20:])
+    assert derived_address == owner.address
 
 
 def test_load_public_key_from_keyfile(runner, keyfile_account):
@@ -993,12 +1069,12 @@ def test_load(account_manager, keyfile_account):
     assert account == keyfile_account
 
 
-def test_get_deployment_address(owner, vyper_contract_container):
+def test_get_deployment_address(owner, project):
     deployment_address_1 = owner.get_deployment_address()
     deployment_address_2 = owner.get_deployment_address(nonce=owner.nonce + 1)
-    instance_1 = owner.deploy(vyper_contract_container, 490)
+    instance_1 = owner.deploy(project.VyperContract, 490)
     assert instance_1.address == deployment_address_1
-    instance_2 = owner.deploy(vyper_contract_container, 490)
+    instance_2 = owner.deploy(project.VyperContract, 490)
     assert instance_2.address == deployment_address_2
 
 

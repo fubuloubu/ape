@@ -3,7 +3,7 @@ import re
 from typing import Any, ClassVar, cast
 
 import pytest
-from eth_pydantic_types import HashBytes32, HexBytes
+from eth_pydantic_types import HexBytes, HexBytes32
 from eth_typing import HexAddress, HexStr
 from ethpm_types import ContractType, ErrorABI
 from ethpm_types.abi import ABIType, EventABI, MethodABI
@@ -19,6 +19,7 @@ from ape_ethereum.trace import TransactionTrace
 from ape_ethereum.transactions import (
     DynamicFeeTransaction,
     Receipt,
+    SetCodeTransaction,
     SharedBlobReceipt,
     SharedBlobTransaction,
     StaticFeeTransaction,
@@ -135,7 +136,7 @@ def test_encode_calldata(ethereum, address):
         ],
     )
     byte_array = ["0x456", "0x678"]
-    values = ("0x123", address, HexBytes(55), byte_array)
+    values = ("0x0123", address, HexBytes(55), byte_array)
 
     actual = ethereum.encode_calldata(abi, *values)
     expected = HexBytes(
@@ -147,8 +148,11 @@ def test_encode_calldata(ethereum, address):
         "0000000000000000000000000000000000000000000000000000000000000037"
         # byte_array
         "0000000000000000000000000000000000000000000000000000000000000080"
+        # length
         "0000000000000000000000000000000000000000000000000000000000000002"
+        # first bytes4
         "0456000000000000000000000000000000000000000000000000000000000000"
+        # second bytes4
         "0678000000000000000000000000000000000000000000000000000000000000"
     )
     assert actual == expected
@@ -725,9 +729,9 @@ def test_gas_limit_live_networks(ethereum):
     assert network.gas_limit == "auto"
 
 
-def test_encode_blueprint_contract(ethereum, vyper_contract_type):
-    actual = ethereum.encode_contract_blueprint(vyper_contract_type)
-    ct_bytes = vyper_contract_type.deployment_bytecode.to_bytes()
+def test_encode_blueprint_contract(ethereum, project):
+    actual = ethereum.encode_contract_blueprint(project.VyperContract.contract_type)
+    ct_bytes = project.VyperContract.contract_type.deployment_bytecode.to_bytes()
 
     # EIP-5202
     expected = (
@@ -744,7 +748,7 @@ def test_encode_blueprint_contract(ethereum, vyper_contract_type):
 
 def test_decode_returndata(ethereum):
     abi = make_method_abi("doThing", outputs=[{"name": "", "type": "bool"}])
-    data = HashBytes32.__eth_pydantic_validate__(0)
+    data = HexBytes32.__eth_pydantic_validate__(0)
     actual = ethereum.decode_returndata(abi, data)
     assert actual == (False,)
 
@@ -916,6 +920,16 @@ def test_create_transaction_blob_versioned_hashed(kwarg_name, value, ethereum):
     tx = ethereum.create_transaction(**{kwarg_name: [value]})
     assert isinstance(tx, SharedBlobTransaction)
     assert tx.blob_versioned_hashes == [HexBytes(value)]
+
+
+@pytest.mark.parametrize(
+    "tx_kwargs",
+    [{"type": 4}, {"authorizationList": []}],
+)
+def test_create_transaction_set_code(tx_kwargs, ethereum):
+    tx = ethereum.create_transaction(**tx_kwargs)
+    assert isinstance(tx, SetCodeTransaction)
+    assert tx.type == TransactionType.SET_CODE.value
 
 
 @pytest.mark.parametrize("tx_type", TransactionType)
@@ -1224,7 +1238,7 @@ def test_enrich_trace_avoids_using_wrong_contract_type(
     assert ct == vyper_contract_instance.contract_type
 
 
-def test_get_deployment_address(ethereum, owner, vyper_contract_container):
+def test_get_deployment_address(ethereum, owner, project):
     actual = ethereum.get_deployment_address(owner.address, owner.nonce)
-    expected = owner.deploy(vyper_contract_container, 490)
+    expected = owner.deploy(project.VyperContract, 490)
     assert actual == expected

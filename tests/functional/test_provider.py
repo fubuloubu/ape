@@ -3,13 +3,13 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-from eth_pydantic_types import HashBytes32
+from eth_pydantic_types import HexBytes32
 from eth_tester.exceptions import TransactionFailed  # type: ignore
 from eth_typing import HexStr
 from eth_utils import ValidationError, to_hex
 from hexbytes import HexBytes
 from requests import HTTPError
-from web3.exceptions import ContractPanicError, TimeExhausted
+from web3.exceptions import ContractPanicError, ExtraDataLengthError, TimeExhausted
 
 from ape import convert
 from ape.api.providers import SubprocessProvider
@@ -136,14 +136,14 @@ def test_chain_id_from_ethereum_base_provider_is_cached(mock_web3, ethereum, eth
 
 
 def test_chain_id_when_disconnected(eth_tester_provider):
+    expected = DEFAULT_TEST_CHAIN_ID
     eth_tester_provider.disconnect()
     try:
         actual = eth_tester_provider.chain_id
-        expected = DEFAULT_TEST_CHAIN_ID
-        assert actual == expected
-
     finally:
         eth_tester_provider.connect()
+
+    assert actual == expected
 
 
 def test_chain_id_adhoc_http(networks):
@@ -434,7 +434,7 @@ def test_send_transaction_when_no_error_and_receipt_fails(
 
     try:
         # NOTE: Value is meaningless.
-        tx_hash = HashBytes32.__eth_pydantic_validate__(123**36)
+        tx_hash = HexBytes32.__eth_pydantic_validate__(123**36)
 
         # Sending tx "works" meaning no vm error.
         mock_eth_tester.ethereum_tester.send_raw_transaction.return_value = tx_hash
@@ -582,6 +582,58 @@ def test_base_fee(eth_tester_provider):
     #   RPC correctly. There was a bug where we were not.
     actual = eth_tester_provider._get_fee_history(0)
     assert "baseFeePerGas" in actual
+
+
+def test_has_poa_history_block_data(mock_web3, ethereum, eth_tester_provider):
+    class PluginProvider(EthereumNodeProvider):
+        pass
+
+    provider = PluginProvider(name="prov", network=ethereum.sepolia)
+    provider._web3 = mock_web3
+
+    key = "proofOfAuthorityData"
+    mock_web3.eth.get_block.return_value = {key: 123}
+
+    assert provider.has_poa_history
+
+
+def test_has_poa_history_block_exception(mock_web3, ethereum, eth_tester_provider):
+    class PluginProvider(EthereumNodeProvider):
+        pass
+
+    provider = PluginProvider(name="prov", network=ethereum.sepolia)
+    provider._web3 = mock_web3
+    mock_web3.eth.get_block.side_effect = ExtraDataLengthError
+    assert provider.has_poa_history
+
+
+def test_has_poa_history_checks_earliest_and_latest_block(mock_web3, ethereum, eth_tester_provider):
+    class PluginProvider(EthereumNodeProvider):
+        pass
+
+    provider = PluginProvider(name="prov", network=ethereum.sepolia)
+    provider._web3 = mock_web3
+
+    def get_block_side_effect(block_id):
+        if block_id == "earliest":
+            return {"blockNumber": 0}
+        elif block_id == "latest":
+            return {"blockNumber": 1, "proofOfAuthorityData": 123}
+
+    mock_web3.eth.get_block.side_effect = get_block_side_effect
+    poa_detected = provider.has_poa_history
+    assert mock_web3.eth.get_block.call_count == 2
+    assert poa_detected
+
+
+def test_has_poa_history_false(mock_web3, ethereum, eth_tester_provider):
+    class PluginProvider(EthereumNodeProvider):
+        pass
+
+    provider = PluginProvider(name="prov", network=ethereum.sepolia)
+    provider._web3 = mock_web3
+    mock_web3.eth.get_block.return_value = {}
+    assert not provider.has_poa_history
 
 
 def test_create_access_list(eth_tester_provider, vyper_contract_instance, owner):

@@ -29,6 +29,8 @@ from web3.exceptions import (
     TransactionNotFound,
 )
 
+from ape.types.private_mempool import Bundle, SimulationReport
+
 try:
     from web3.exceptions import Web3RPCError  # type: ignore
 except ImportError:
@@ -41,7 +43,7 @@ from web3.providers.auto import load_provider_from_environment
 from web3.types import FeeHistory, RPCEndpoint, TxParams
 
 from ape.api.address import Address
-from ape.api.providers import BlockAPI, ProviderAPI
+from ape.api.providers import BlockAPI, CallResult, ProviderAPI
 from ape.api.transactions import ReceiptAPI, TransactionAPI
 from ape.exceptions import (
     _SOURCE_TRACEBACK_ARG,
@@ -182,12 +184,16 @@ class Web3Provider(ProviderAPI, ABC):
 
         # Patching the provider to call a post send_transaction() hook
         def post_tx_hook(send_tx):
+            if getattr(send_tx, "_is_post_tx_wrapped", False):
+                return send_tx
+
             @wraps(send_tx)
             def send_tx_wrapper(self, txn: TransactionAPI) -> ReceiptAPI:
                 receipt = send_tx(self, txn)
                 _post_send_transaction(txn, receipt)
                 return receipt
 
+            send_tx_wrapper._is_post_tx_wrapped = True  # type: ignore
             return send_tx_wrapper
 
         send_tx_wrapper = post_tx_hook(cls.send_transaction)
@@ -809,8 +815,13 @@ class Web3Provider(ProviderAPI, ABC):
                 raise vm_err.with_ape_traceback() from err
 
             else:
+                # Return the failed call result.
                 logger.error(vm_err)
-                result = "0x"
+                return (
+                    CallResult.from_revert(vm_err)
+                    if isinstance(vm_err, ContractLogicError)
+                    else "0x"
+                )
 
         if "error" in result:
             raise ProviderError(result["error"]["message"])
@@ -1045,7 +1056,7 @@ class Web3Provider(ProviderAPI, ABC):
         last_hash = fake_last_block.hash or HexBytes(0)
         last: YieldAction = YieldAction(number=last_num, hash=last_hash, time=time.time())
 
-        # A helper method for various points of ensuring we didn't timeout.
+        # A helper method for various points of ensuring we didn't receive a timeout.
         def assert_chain_activity():
             time_waiting = time.time() - last.time
             if time_waiting > timeout:
@@ -1059,10 +1070,12 @@ class Web3Provider(ProviderAPI, ABC):
             try:
                 if head.number is None or head.hash is None:
                     raise ProviderError("Head block has no number or hash.")
+
                 # Use an "adjusted" head, based on the required confirmations.
                 adjusted_head = self.get_block(head.number - required_confirmations)
                 if adjusted_head.number is None or adjusted_head.hash is None:
                     raise ProviderError("Adjusted head block has no number or hash.")
+
             except Exception:
                 # TODO: I did encounter this sometimes in a re-org, needs better handling
                 # and maybe bubbling up the block number/hash exceptions above.
@@ -1086,7 +1099,8 @@ class Web3Provider(ProviderAPI, ABC):
                 # Catch up the chain by setting the "next" to this tiny head.
                 next_block = adjusted_head.number
 
-                # NOTE: Drop down to code outside of switch-of-ifs
+                last.time = time.time()
+                # NOTE: Drop down to code outside switch-of-ifs
 
             elif adjusted_head.number < next_block:
                 # Wait for the next block.
@@ -1101,15 +1115,16 @@ class Web3Provider(ProviderAPI, ABC):
                 block = self.get_block(block_idx)
                 if block.number is None or block.hash is None:
                     raise ProviderError("Block has no number or hash.")
-                yield block
-
-                # This is the point at which the daemon will end,
-                # provider the user passes in a `stop_block` arg.
-                if stop_block is not None and block.number >= stop_block:
-                    return
 
                 # Set the last action, used for checking timeouts and re-orgs.
                 last = YieldAction(number=block.number, hash=block.hash, time=time.time())
+
+                yield block
+
+                # This is the point at which the daemon will end,
+                # provided the user passes in a `stop_block` arg.
+                if stop_block is not None and block.number >= stop_block:
+                    return
 
     def poll_logs(
         self,
@@ -1189,7 +1204,11 @@ class Web3Provider(ProviderAPI, ABC):
             and txn.gas_price is None
         ):
             txn.gas_price = self.gas_price
-        elif txn_type in (TransactionType.DYNAMIC, TransactionType.SHARED_BLOB):
+        elif txn_type in (
+            TransactionType.DYNAMIC,
+            TransactionType.SHARED_BLOB,
+            TransactionType.SET_CODE,
+        ):
             if txn.max_priority_fee is None:
                 txn.max_priority_fee = self.priority_fee
 
@@ -1236,13 +1255,15 @@ class Web3Provider(ProviderAPI, ABC):
     def send_transaction(self, txn: TransactionAPI) -> ReceiptAPI:
         vm_err = None
         txn_data = None
+        raise_on_revert = txn.raise_on_revert
+
         try:
             txn_hash = self._send_transaction(txn)
         except (Web3RPCError, Web3ContractLogicError) as err:
             vm_err = self.get_virtual_machine_error(
                 err, txn=txn, set_ape_traceback=txn.raise_on_revert
             )
-            if txn.raise_on_revert:
+            if raise_on_revert:
                 raise vm_err from err
             else:
                 txn_hash = to_hex(txn.txn_hash)
@@ -1298,13 +1319,13 @@ class Web3Provider(ProviderAPI, ABC):
                 self.web3.eth.call(txn_params)
             except Exception as err:
                 vm_err = self.get_virtual_machine_error(
-                    err, txn=txn, set_ape_traceback=txn.raise_on_revert
+                    err, txn=txn, set_ape_traceback=raise_on_revert
                 )
                 receipt.error = vm_err
-                if txn.raise_on_revert:
+                if raise_on_revert:
                     raise vm_err from err
 
-            if txn.raise_on_revert:
+            if raise_on_revert:
                 # If we get here, for some reason the tx-replay did not produce
                 # a VM error.
                 receipt.raise_for_status()
@@ -1382,6 +1403,7 @@ class Web3Provider(ProviderAPI, ABC):
                 or re.match(r"[m|M]ethod .*?not found", message)
                 or message.startswith("Unknown RPC Endpoint")
                 or "RPC Endpoint has not been implemented" in message
+                or message == "unimplemented"
             ):
                 raise APINotImplementedError(
                     f"RPC method '{rpc}' is not implemented by this node instance."
@@ -1592,6 +1614,37 @@ class EthereumNodeProvider(Web3Provider, ABC):
         return self.data_dir / "geth.ipc"
 
     @cached_property
+    def has_poa_history(self) -> bool:
+        """
+        ``True`` if detected any PoA history. If the chain was _ever_ PoA, the special
+        middleware is needed for web3.py. Provider plugins use this property when
+        creating Web3 instances.
+        """
+        findings = False
+        for option in ("earliest", "latest"):
+            try:
+                block = self.web3.eth.get_block(option)  # type: ignore[arg-type]
+
+            except ExtraDataLengthError:
+                findings = True
+                break
+
+            except Exception:
+                # Some chains are "light" and we may not be able to detect
+                # if it needs PoA middleware.
+                continue
+
+            else:
+                findings = (
+                    "proofOfAuthorityData" in block
+                    or len(block.get("extraData", "")) > MAX_EXTRADATA_LENGTH
+                )
+                if findings:
+                    break
+
+        return findings
+
+    @cached_property
     def _ots_api_level(self) -> Optional[int]:
         # NOTE: Returns None when OTS namespace is not enabled.
         try:
@@ -1641,36 +1694,10 @@ class EthereumNodeProvider(Web3Provider, ABC):
         if not self.network.is_dev:
             self.web3.eth.set_gas_price_strategy(rpc_gas_price_strategy)
 
-        chain_id = self.chain_id
-
-        # NOTE: We have to check both earliest and latest
-        #   because if the chain was _ever_ PoA, we need
-        #   this middleware.
-        is_likely_poa = False
-        for option in ("earliest", "latest"):
-            try:
-                block = self.web3.eth.get_block(option)  # type: ignore[arg-type]
-
-            except ExtraDataLengthError:
-                is_likely_poa = True
-                break
-
-            except Exception:
-                # Some chains are "light" and we may not be able to detect
-                # if it needs PoA middleware.
-                continue
-
-            else:
-                is_likely_poa = (
-                    "proofOfAuthorityData" in block
-                    or len(block.get("extraData", "")) > MAX_EXTRADATA_LENGTH
-                )
-                if is_likely_poa:
-                    break
-
-        if is_likely_poa and ExtraDataToPOAMiddleware not in self.web3.middleware_onion:
+        if self.has_poa_history and ExtraDataToPOAMiddleware not in self.web3.middleware_onion:
             self.web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
+        chain_id = self.chain_id
         self.network.verify_chain_id(chain_id)
 
         # Correct network name, if using custom-URL approach.
@@ -1727,6 +1754,23 @@ class EthereumNodeProvider(Web3Provider, ABC):
 
         self._complete_connect()
 
+    def simulate_transaction_bundle(
+        self, bundle: Bundle, sim_overrides: Optional[dict] = None
+    ) -> SimulationReport:
+        """
+        Submit a bundle and get the simulation result.
+
+        Args:
+            bundle (:class:`~ape.types.private_mempool.Bundle`) A bundle of transactions to send to the matchmaker.
+            sim_overrides (dict | None) Optional fields to override simulation state.
+
+        Returns:
+            :class:`~ape.types.private_mempool.SimulationReport`
+        """
+        bundle_request = {"bundle": bundle.model_dump(), "simOverrides": sim_overrides or {}}
+        result = self.provider.make_request("mev_simBundle", bundle_request)
+        return SimulationReport.model_validate(result)
+
 
 def _create_web3(
     http_uri: Optional[str] = None,
@@ -1749,6 +1793,14 @@ def _create_web3(
         providers.append(lambda: WebsocketProvider(endpoint_uri=ws))
 
     provider = AutoProvider(potential_providers=providers)
+
+    # TODO: Getting attribute error without this. Figure out why and do proper fix.
+    class MockBatchingContext:
+        def get(self, *args, **kwargs):
+            return None
+
+    provider._batching_context = MockBatchingContext()  # type: ignore
+
     return Web3(provider, middleware=[])
 
 

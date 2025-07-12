@@ -3,7 +3,6 @@ import os
 import shutil
 from collections.abc import Iterable
 from functools import cached_property
-from importlib import metadata
 from pathlib import Path
 from typing import Optional, Union
 
@@ -53,7 +52,8 @@ class LocalDependency(DependencyAPI):
     def validate_local_path(cls, model):
         # Resolves the relative path so if the dependency API
         # data moves, it will still work.
-        path = Path(model["local"])
+        path = Path(model["local"]).expanduser()
+        model["local"] = f"{path}"
 
         # Automatically include `"name"`.
         if "name" not in model:
@@ -73,7 +73,7 @@ class LocalDependency(DependencyAPI):
 
     def __repr__(self) -> str:
         path = clean_path(self.local)
-        return f"<LocalDependency local={path}, version={self.version}>"
+        return f"<LocalDependency local={path}, version={self.version_id}>"
 
     @property
     def package_id(self) -> str:
@@ -102,7 +102,7 @@ class LocalDependency(DependencyAPI):
 
 class GithubDependency(DependencyAPI):
     """
-    A dependency from Github. Use the ``github`` key in your ``dependencies:``
+    A dependency from GitHub. Use the ``github`` key in your ``dependencies:``
     section of your ``ape-config.yaml`` file to declare a dependency from GitHub.
 
     Config example::
@@ -490,24 +490,25 @@ class PythonDependency(DependencyAPI):
 
     @property
     def version_id(self) -> str:
-        if self.pypi:
+        if self.version:
+            # It is helpful to just return the cfg version here
+            # so uninstalled dependencies can attempt to set up their caches.
+            return self.version
+
+        elif self.pypi:
             # Version available in package data.
-            if not (vers := self.version_from_package_data or ""):
-                # I doubt this is a possible condition, but just in case.
-                raise ProjectError(f"Missing version from PyPI for package '{self.package_id}'.")
+            vers = self._get_version_from_package_data()
 
         elif self.site_package:
-            try:
-                vers = f"{metadata.version(self.package_id)}"
-            except metadata.PackageNotFoundError as err:
-                raise ProjectError(f"Dependency '{self.package_id}' not installed.") from err
+            # Python dependency not installed; attempt to use latest from pypi.
+            if pkg_vers := self.version_from_package_data:
+                return pkg_vers
 
-            if spec_vers := self.version:
-                if spec_vers != vers:
-                    raise ProjectError(
-                        "Dependency installed with mismatched version. "
-                        f"Expecting '{self.version}' but has '{vers}'"
-                    )
+            # Force the user to specify the version, as it is not installed and not
+            # available on PyPI.
+            raise ProjectError(
+                f"Dependency '{self.name}' not installed. Either install or specify the `version:` to continue."
+            )
 
         else:
             raise ProjectError(
@@ -539,12 +540,11 @@ class PythonDependency(DependencyAPI):
             response.raise_for_status()
         except requests.HTTPError as err:
             if err.response.status_code == 404:
-                raise ProjectError(
-                    f"Unknown dependency '{self.package_id}'. "
-                    "Is it spelled correctly and available on PyPI? "
-                    "For local Python packages, use the `python:` key."
-                )
+                # There is no available package data on PyPI; use empty dict.
+                return {}
+
             else:
+                # It should have worked in this case, so it is good to raise an error.
                 raise ProjectError(
                     f"Problem downloading package data for '{self.package_id}': {err}"
                 )
@@ -559,7 +559,7 @@ class PythonDependency(DependencyAPI):
     def download_archive_url(self) -> str:
         if not (version := self.version):
             if not (version := self.version_from_package_data):
-                # Not sure this is possible, but just in case API data changes or something.
+                # Not sure if this is possible, but just in case API data changes or something.
                 raise ProjectError(f"Unable to find version for package '{self.package_id}'.")
 
         releases = self.package_data.get("releases", {})
@@ -602,3 +602,10 @@ class PythonDependency(DependencyAPI):
                     file.write(chunk)
 
         return archive_destination
+
+    def _get_version_from_package_data(self) -> str:
+        if vers := self.version_from_package_data:
+            return vers
+
+        # I doubt this is a possible condition, but just in case.
+        raise ProjectError(f"Missing version from PyPI for package '{self.package_id}'.")

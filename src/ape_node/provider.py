@@ -1,14 +1,18 @@
 import atexit
+import os.path
+import re
 import shutil
 from pathlib import Path
 from subprocess import DEVNULL, PIPE, Popen
 from typing import TYPE_CHECKING, Any, Optional, Union
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 from eth_utils import add_0x_prefix, to_hex
 from geth.chain import initialize_chain as initialize_gethdev_chain
 from geth.process import BaseGethProcess
-from geth.wrapper import construct_test_chain_kwargs
+from geth.wrapper import ALL_APIS, construct_test_chain_kwargs
 from pydantic import field_validator
 from pydantic_settings import SettingsConfigDict
 from requests.exceptions import ConnectionError
@@ -92,6 +96,10 @@ def create_genesis_data(alloc: Alloc, chain_id: int) -> "GenesisDataTypedDict":
     }
 
 
+def get_node_name_from_executable(executable: str) -> str:
+    return executable.split(os.path.sep)[-1] or "geth"
+
+
 class GethDevProcess(BaseGethProcess):
     """
     A developer-configured geth that only exists until disconnected.
@@ -110,7 +118,7 @@ class GethDevProcess(BaseGethProcess):
         number_of_accounts: int = DEFAULT_NUMBER_OF_TEST_ACCOUNTS,
         chain_id: int = DEFAULT_TEST_CHAIN_ID,
         initial_balance: Union[str, int] = DEFAULT_TEST_ACCOUNT_BALANCE,
-        executable: Optional[str] = None,
+        executable: Optional[Union[list[str], str]] = None,
         auto_disconnect: bool = True,
         extra_funded_accounts: Optional[list[str]] = None,
         hd_path: Optional[str] = DEFAULT_TEST_HD_PATH,
@@ -118,19 +126,47 @@ class GethDevProcess(BaseGethProcess):
         generate_accounts: bool = True,
         initialize_chain: bool = True,
         background: bool = False,
+        verify_bin: bool = True,
+        rpc_api: Optional[list[str]] = None,
     ):
-        executable = executable or "geth"
-        if not shutil.which(executable):
-            raise NodeSoftwareNotInstalledError()
+        if isinstance(executable, str):
+            # Legacy.
+            executable = [executable]
 
+        if executable:
+            if verify_bin and (
+                not Path(executable[0]).exists() and not shutil.which(executable[0])
+            ):
+                raise NodeSoftwareNotInstalledError()
+
+        else:
+            # Executable not specified: attempt to find one in $PATH.
+            if shutil.which("geth"):
+                executable = ["geth"]
+            elif shutil.which("reth"):
+                executable = ["reth", "node"]
+            elif verify_bin:
+                # TODO: Add support for more nodes, such as erigon.
+                raise NodeSoftwareNotInstalledError()
+            else:
+                # This probably won't work if started, but the user knows that.
+                executable = ["geth"]
+
+        self.executable = executable or ["geth"]
         self._data_dir = data_dir
         self.is_running = False
         self._auto_disconnect = auto_disconnect
         self.background = background
 
+        is_reth = executable[0].endswith("reth")
+
+        if is_reth and hostname == "localhost":
+            # Reth only supports IP format.
+            hostname = "127.0.0.1"
+
         kwargs_ctor: dict = {
             "data_dir": self.data_dir,
-            "geth_executable": executable,
+            "geth_executable": executable[0],
             "network_id": f"{chain_id}",
         }
         if hostname is not None:
@@ -150,10 +186,34 @@ class GethDevProcess(BaseGethProcess):
             kwargs_ctor["ws_enabled"] = False
             kwargs_ctor["ws_addr"] = None
             kwargs_ctor["ws_port"] = None
-        if block_time is not None:
+        if block_time is not None and not is_reth:
             kwargs_ctor["dev_period"] = f"{block_time}"
 
+        if rpc_api is None:
+            # Reth also has MEV API support.
+            rpc_api_str = f"{ALL_APIS},mev" if is_reth else ALL_APIS
+        else:
+            rpc_api_str = ",".join(rpc_api)
+
+        kwargs_ctor["rpc_api"] = rpc_api_str
         geth_kwargs = construct_test_chain_kwargs(**kwargs_ctor)
+        if is_reth:
+            geth_kwargs.pop("max_peers", None)
+            geth_kwargs.pop("network_id", None)
+            geth_kwargs.pop("no_discover", None)
+
+            # NOTE: --verbosity _is_ available in reth, but it is a different type (flag only).
+            #   It isn't really needed anyway (I don't think).
+            geth_kwargs.pop("verbosity", None)
+
+            geth_kwargs.pop("password", None)
+
+        # Ensure IPC path has correct name.
+        if ipc_path_kwarg := geth_kwargs.get("ipc_path"):
+            if ipc_path_kwarg.endswith("geth.ipc"):
+                geth_kwargs["ipc_path"] = ipc_path_kwarg.replace(
+                    "geth.ipc", f"{self.process_name}.ipc"
+                )
 
         # Ensure a clean data-dir.
         self._clean()
@@ -174,9 +234,14 @@ class GethDevProcess(BaseGethProcess):
             bal_dict = {"balance": str(initial_balance)}
             alloc = dict.fromkeys(addresses, bal_dict)
             genesis = create_genesis_data(alloc, chain_id)
+            self._data_dir.mkdir(parents=True, exist_ok=True)
             initialize_gethdev_chain(genesis, self.data_dir)
 
         super().__init__(geth_kwargs)
+
+        # Correct multi-word executable.
+        idx = self.command.index(executable[0])
+        self.command = self.command[:idx] + executable + self.command[idx + 1 :]
 
     @classmethod
     def from_uri(cls, uri: str, data_folder: Path, **kwargs):
@@ -188,16 +253,19 @@ class GethDevProcess(BaseGethProcess):
         if isinstance(block_time, int):
             block_time = f"{block_time}"
 
+        executable = kwargs.get("executable")
+
         process_kwargs = {
             "auto_disconnect": kwargs.get("auto_disconnect", True),
             "background": kwargs.get("background", False),
             "block_time": block_time,
-            "executable": kwargs.get("executable"),
+            "executable": executable,
             "extra_funded_accounts": extra_accounts,
             "hd_path": kwargs.get("hd_path", DEFAULT_TEST_HD_PATH),
             "initial_balance": balance,
             "mnemonic": mnemonic,
             "number_of_accounts": number_of_accounts,
+            "verify_bin": kwargs.get("verify_bin", True),
         }
 
         parsed_uri = urlparse(uri)
@@ -212,8 +280,9 @@ class GethDevProcess(BaseGethProcess):
 
         elif hostname := parsed_uri.hostname:
             if hostname not in ("localhost", "127.0.0.1"):
+                name = get_node_name_from_executable(executable) if executable else "geth"
                 raise ConnectionError(
-                    f"Unable to start Geth on non-local host {parsed_uri.hostname}."
+                    f"Unable to start {name} on non-local host {parsed_uri.hostname}."
                 )
 
             if parsed_uri.scheme.startswith("ws"):
@@ -230,6 +299,42 @@ class GethDevProcess(BaseGethProcess):
     @property
     def data_dir(self) -> str:
         return f"{self._data_dir}"
+
+    @property
+    def process_name(self) -> str:
+        return get_node_name_from_executable(self.executable[0])
+
+    @property
+    def ipc_path(self) -> str:
+        # Overridden: so we can use a custom IPC path name (e.g. reth.ipc).
+        return self.geth_kwargs.get("ipc_path") or os.path.abspath(
+            os.path.expanduser(
+                os.path.join(
+                    self.data_dir,
+                    f"{self.process_name}.ipc",
+                )
+            )
+        )
+
+    @property
+    def is_rpc_ready(self) -> bool:
+        # Overridden: This is overridden to work with other nodes besides `geth`.
+        #   Otherwise, the RPC is never declared as ready even though it is.
+        try:
+            urlopen(f"http://{self.rpc_host}:{self.rpc_port}")
+
+        except HTTPError:
+            # Reth nodes (and maybe others) might throw an HTTP error here, like "method not found".
+            # This means the RPC is ready.
+            return True
+
+        except URLError:
+            # Nothing found at all yet, most likely.
+            return False
+
+        else:
+            # No error occurs on Geth nodes when the RPC is ready.
+            return True
 
     @property
     def _hostname(self) -> Optional[str]:
@@ -275,8 +380,7 @@ class GethDevProcess(BaseGethProcess):
                 ws_log = f"{ws_log}:{port}"
 
         connection_logs = ", ".join(x for x in (http_log, ipc_log, ws_log) if x)
-
-        logger.info(f"Starting geth ({connection_logs}).")
+        logger.info(f"Starting {self.process_name} ({connection_logs}).")
 
     def start(self):
         if self.is_running:
@@ -298,22 +402,14 @@ class GethDevProcess(BaseGethProcess):
 
     def disconnect(self):
         if self.is_running:
-            logger.info("Stopping 'geth' process.")
+            logger.info(f"Stopping '{self.process_name}' process.")
             self.stop()
 
         self._clean()
 
     def _clean(self):
         if self._data_dir.is_dir():
-            # In case data-dir is being used for something else,
-            # only delete geth-dev node related stuff.
-            (self._data_dir / "genesis.json").unlink(missing_ok=True)
-            shutil.rmtree((self._data_dir / "geth").as_posix(), ignore_errors=True)
-            shutil.rmtree((self._data_dir / "keystore").as_posix(), ignore_errors=True)
-            shutil.rmtree((self._data_dir / "subprocess_output").as_posix(), ignore_errors=True)
-
-        # dir must exist when initializing chain.
-        self._data_dir.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(self._data_dir)
 
     def wait(self, *args, **kwargs):
         if self.proc is None:
@@ -361,7 +457,7 @@ class EthereumNodeConfig(PluginConfig):
     such as which URIs to use for each network.
     """
 
-    executable: Optional[str] = None
+    executable: Optional[list[str]] = None
     """
     For starting nodes, select the executable. Defaults to using
     ``shutil.which("geth")``.
@@ -390,6 +486,11 @@ class EthereumNodeConfig(PluginConfig):
     Optionally specify request headers to use whenever using this provider.
     """
 
+    rpc_api: Optional[list[str]] = None
+    """
+    RPC APIs to enable. Defaults to all geth APIs.
+    """
+
     model_config = SettingsConfigDict(extra="allow", env_prefix="APE_NODE_")
 
     @field_validator("call_trace_approach", mode="before")
@@ -397,6 +498,17 @@ class EthereumNodeConfig(PluginConfig):
     def validate_trace_approach(cls, value):
         # This handles nicer config values.
         return None if value is None else TraceApproach.from_key(value)
+
+    @field_validator("executable", mode="before")
+    @classmethod
+    def validate_executable(cls, value):
+        if not value:
+            return None
+
+        elif isinstance(value, str):
+            return value.split(" ")
+
+        return value
 
 
 class NodeSoftwareNotInstalledError(ConnectionError):
@@ -418,7 +530,13 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
 
     @property
     def process_name(self) -> str:
-        return self.name
+        if self._process:
+            return self._process.process_name
+
+        elif exec_cfg := self.config.executable:
+            return get_node_name_from_executable(exec_cfg[0])
+
+        return "geth"
 
     @property
     def chain_id(self) -> int:
@@ -455,6 +573,24 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
     def auto_mine(self, value):
         raise NotImplementedError("'auto_mine' setter not implemented.")
 
+    @property
+    def ipc_path(self) -> Optional[Path]:
+        if rpc := self._configured_ipc_path:
+            # "ipc_path" found in config/settings
+            return Path(rpc)
+
+        elif rpc := self._configured_uri:
+            if f"{rpc}".endswith(".ipc"):
+                # "uri" found in config/settings and is IPC.
+                return Path(rpc)
+
+        elif proc := self._process:
+            # Connected.
+            return Path(proc.ipc_path)
+
+        # Default (used by geth-process).
+        return self.data_dir / self.process_name / f"{self.process_name}.ipc"
+
     def connect(self):
         self._set_web3()
         if self.is_connected:
@@ -470,7 +606,8 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
         geth_dev.connect(timeout=timeout)
         if not self.web3.is_connected():
             geth_dev.disconnect()
-            raise ConnectionError("Unable to connect to locally running geth.")
+
+            raise ConnectionError(f"Unable to connect to locally running {geth_dev.process_name}.")
         else:
             self.web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
@@ -514,10 +651,10 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
         test_config["initial_balance"] = self.test_config.balance
         test_config["background"] = self.background
         uri = self.ws_uri or self.uri
-
+        proc_data_dir = self.data_dir / f"{self.process_name}"
         return GethDevProcess.from_uri(
             uri,
-            self.data_dir,
+            proc_data_dir,
             block_time=self.block_time,
             **test_config,
         )
@@ -541,6 +678,11 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
         super().disconnect()
 
     def send_transaction(self, txn: "TransactionAPI") -> "ReceiptAPI":
+        return self._send_transaction_with_retries(txn)
+
+    def _send_transaction_with_retries(
+        self, txn: "TransactionAPI", nonce_retries: int = 0, max_nonce_retries: int = 5
+    ) -> "ReceiptAPI":
         try:
             return super().send_transaction(txn)
         except VirtualMachineError as err:
@@ -550,11 +692,37 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
             ):
                 # Changed, possibly due to other transactions (x-dist?).
                 # Retry using block gas limit.
-                txn.gas_limit = self.chain_manager.blocks.head.gas_limit
+                block_gas_limit = self.chain_manager.blocks.head.gas_limit
+                if txn.gas_limit > block_gas_limit:
+                    txn.gas_limit = block_gas_limit
+                elif txn.gas_limit == block_gas_limit:
+                    txn.gas_limit -= 1
+                else:
+                    # Raise whatever error it is. I am not sure how this is possible!
+                    raise
+
                 account = self.account_manager.test_accounts[txn.sender]
                 signed_transaction = account.sign_transaction(txn)
                 logger.debug("Gas-limit exceeds block gas limit. Retrying using block gas limit.")
                 return super().send_transaction(signed_transaction)
+
+            elif txn.sender in self.account_manager.test_accounts and re.match(
+                r".*Nonce '\d*' is too low.*", str(err)
+            ):
+                retries = nonce_retries + 1
+                if retries > max_nonce_retries:
+                    raise  # This error.
+
+                # Try again with a new nonce.
+                account = self.account_manager.test_accounts[txn.sender]
+                txn.nonce = account.nonce
+                signed_transaction = account.sign_transaction(txn)
+                logger.debug("Test transaction received bad nonce. Retrying using latest nonce.")
+                return self._send_transaction_with_retries(
+                    signed_transaction,
+                    nonce_retries=retries,
+                    max_nonce_retries=max_nonce_retries,
+                )
 
             raise  # Whatever error it already is (Ape-ified from ape-ethereum.provider base).
 

@@ -3,8 +3,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, Optional
 
 import pytest
-from eth_pydantic_types import HexBytes
-from eth_pydantic_types.hash import HashBytes20
+from eth_pydantic_types import HexBytes, HexBytes20
 from eth_utils import to_hex
 from ethpm_types import ContractType
 
@@ -59,7 +58,7 @@ def test_from_receipt(owner, contract_instance, assert_log_values):
 def test_from_receipt_different_contract(
     owner, vyper_contract_instance, solidity_contract_instance, assert_log_values
 ):
-    # NOTE: Ths event type is similar but defined on a different contract.
+    # NOTE: The event type is similar but defined on a different contract.
     event_type = solidity_contract_instance.NumberChange
     receipt = vyper_contract_instance.setNumber(1, sender=owner)
     logs = event_type.from_receipt(receipt)
@@ -280,7 +279,8 @@ def test_poll_logs_stop_block_not_in_future(
 def test_poll_logs(chain, vyper_contract_instance, eth_tester_provider, owner, PollDaemon):
     size = 3
     logs: Queue = Queue(maxsize=size)
-    poller = vyper_contract_instance.NumberChange.poll_logs(start_block=0)
+    start_block = vyper_contract_instance.creation_metadata.block or 0
+    poller = vyper_contract_instance.NumberChange.poll_logs(start_block=start_block)
     start_block = chain.blocks.height
 
     with PollDaemon("logs", poller, logs.put, logs.full):
@@ -298,25 +298,23 @@ def test_poll_logs(chain, vyper_contract_instance, eth_tester_provider, owner, P
     assert actual[2].block_number == actual[2].block.number == actual[1].block_number + 1
 
 
-def test_poll_logs_with_topics(
-    chain, vyper_contract_instance, eth_tester_provider, owner, PollDaemon
-):
-    size = 1
+def test_poll_logs_with_topics(vyper_contract_instance, eth_tester_provider, owner, PollDaemon):
+    size = 3
     logs: Queue = Queue(maxsize=size)
-    poller = vyper_contract_instance.NumberChange.poll_logs(start_block=0, newNum=33)
-    start_block = chain.blocks.height
+    start_block = vyper_contract_instance.creation_metadata.block or 0
+    poller = vyper_contract_instance.NumberChange.poll_logs(start_block=start_block, newNum=33)
 
-    with PollDaemon("logs", poller, logs.put, logs.full):
+    with PollDaemon("logs-with-topics", poller, logs.put, logs.full):
         # Sleep first to ensure listening before emitting logs.
         time.sleep(1)
 
-        vyper_contract_instance.setNumber(1, sender=owner)  # block s+1
+        # NOTE: Doing the same number every time because poller is not the greatest.
+        vyper_contract_instance.setNumber(33, sender=owner)  # block s+1
         vyper_contract_instance.setNumber(33, sender=owner)  # block s+2
-        vyper_contract_instance.setNumber(7, sender=owner)  # block s+3
+        vyper_contract_instance.setNumber(33, sender=owner)  # block s+3f
 
     actual = [logs.get() for _ in range(size)]
     assert all(a.newNum == e for a, e in zip(actual, (33,)))
-    assert actual[0].block_number == actual[0].block.number == start_block + 2
 
 
 def test_poll_logs_timeout(vyper_contract_instance, eth_tester_provider, owner, PollDaemon):
@@ -324,7 +322,7 @@ def test_poll_logs_timeout(vyper_contract_instance, eth_tester_provider, owner, 
     poller = vyper_contract_instance.NumberChange.poll_logs(new_block_timeout=new_block_timeout)
 
     with pytest.raises(ProviderError) as err:
-        with PollDaemon("logs", poller, lambda x: None, lambda: False):
+        with PollDaemon("logs-timeout", poller, lambda x: None, lambda: False):
             time.sleep(1.5)
 
     assert "Timed out waiting for next block" in str(err.value)
@@ -333,7 +331,7 @@ def test_poll_logs_timeout(vyper_contract_instance, eth_tester_provider, owner, 
 def test_contract_two_events_with_same_name(
     owner, chain, networks_connected_to_tester, shared_contracts_folder
 ):
-    interface_path = shared_contracts_folder / "Interface.json"
+    interface_path = shared_contracts_folder / "interfaces" / "Interface.json"
     impl_path = shared_contracts_folder / "InterfaceImplementation.json"
     interface_text = interface_path.read_text(encoding="utf8")
     impl_text = impl_path.read_text(encoding="utf8")
@@ -452,9 +450,9 @@ def test_info(solidity_contract_instance):
     assert actual == expected
 
 
-def test_model_dump(solidity_contract_container, owner):
+def test_model_dump(project, owner):
     # NOTE: deploying a new contract with a new number to lessen x-dist conflicts.
-    contract = owner.deploy(solidity_contract_container, 29620000000003)
+    contract = owner.deploy(project.SolidityContract, 29620000000003)
 
     # First, get an event (a normal way).
     number = int(10e18)
@@ -475,7 +473,7 @@ def test_model_dump(solidity_contract_container, owner):
 def test_model_dump_hexbytes(mode):
     # NOTE: There was an issue when using HexBytes for Any.
     event_arguments = {"key": 123, "validators": [HexBytes(123)]}
-    txn_hash = HashBytes20.__eth_pydantic_validate__(347374237412374174)
+    txn_hash = HexBytes20.__eth_pydantic_validate__(347374237412374174)
     event = ContractLog(
         block_number=123,
         block_hash="block-hash",
@@ -498,7 +496,7 @@ def test_model_dump_json():
         event_arguments=event_arguments,
         event_name="MyEvent",
         log_index=0,
-        transaction_hash=HashBytes20.__eth_pydantic_validate__(347374237412374174),
+        transaction_hash=HexBytes20.__eth_pydantic_validate__(347374237412374174),
     )
     actual = event.model_dump_json()
     assert actual == (

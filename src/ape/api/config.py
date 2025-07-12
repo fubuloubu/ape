@@ -176,7 +176,7 @@ class PluginConfig(BaseSettings):
 
     def get(self, key: str, default: Optional[ConfigItemType] = None) -> ConfigItemType:
         extra: dict = self.__pydantic_extra__ or {}
-        return self.__dict__.get(key, extra.get(key, default))
+        return self.__dict__.get(key, extra.get(key, default))  # type: ignore
 
 
 class GenericConfig(ConfigDict):
@@ -499,7 +499,7 @@ class ApeConfig(ExtraAttributesMixin, BaseSettings, ManagerAccessMixin):
         except ValidationError as err:
             if path.suffix == ".json":
                 # TODO: Support JSON configs here.
-                raise  # The validation error as-is
+                raise ConfigError(f"{err}") from err
 
             if final_msg := _get_problem_with_config(err.errors(), path):
                 raise ConfigError(final_msg)

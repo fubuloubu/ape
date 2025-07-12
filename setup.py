@@ -20,10 +20,13 @@ extras_require = {
         "pytest-timeout>=2.2.0,<3",  # For avoiding timing out during tests
         "hypothesis>=6.2.0,<7.0",  # Strategy-based fuzzer
         "hypothesis-jsonschema==0.19.0",  # JSON Schema fuzzer extension
+        "ape-vyper>=0.8.9,<0.9",  # Needed for compiling test contracts
+        "vyper>=0.4.3,<0.5",  # Avoid having to download Vyper binaries
+        "ape-solidity>=0.8.5,<0.9",  # Needed for compiling test contracts
     ],
     "lint": [
-        "ruff>=0.10.0",  # Unified linter and formatter
-        "mypy>=1.15.0,<1.16.0",  # Static type analyzer
+        "ruff>=0.12.0",  # Unified linter and formatter
+        "mypy>=1.16.1,<1.17.0",  # Static type analyzer
         "types-PyYAML",  # Needed due to mypy typeshed
         "types-requests",  # Needed due to mypy typeshed
         "types-setuptools",  # Needed due to mypy typeshed
@@ -86,7 +89,7 @@ setup(
     },
     include_package_data=True,
     install_requires=[
-        "click>=8.1.6,<9",
+        "click>=8.1.6,<8.2",
         "ijson>=3.1.4,<4",
         "ipython>=8.18.1,<9",
         "lazyasd>=0.1.4",
@@ -103,12 +106,12 @@ setup(
         "python-dateutil>=2.8.2,<3",
         "PyYAML>=5.1,<7",
         "requests>=2.28.1,<3",
-        "rich>=12.5.1,<14",
+        "rich>=13.9,<14",
         "SQLAlchemy>=1.4.35",
         "toml; python_version<'3.11'",
-        "tqdm>=4.62.3,<5.0",
+        "tqdm>=4.67,<5.0",
         "traitlets>=5.3.0",
-        "urllib3>=2.0.0,<3",
+        "urllib3>=2.3,<3",
         "watchdog>=3.0,<4",
         # ** Dependencies maintained by Ethereum Foundation **
         "eth-abi>=5.1.0,<6",
@@ -121,10 +124,10 @@ setup(
         "web3[tester]>=6.20.1,<8",
         # ** Dependencies maintained by ApeWorX **
         "eip712>=0.2.10,<0.3",
-        "ethpm-types>=0.6.25,<0.7",
-        "eth_pydantic_types>=0.1.3,<0.2",
+        "ethpm-types>=0.6.27,<0.7",
+        "eth_pydantic_types>=0.2.1,<0.3",
         "evmchains>=0.1.0,<0.2",
-        "evm-trace>=0.2.3,<0.3",
+        "evm-trace>=0.2.6,<0.3",
     ],
     entry_points={
         "console_scripts": ["ape=ape._cli:cli"],

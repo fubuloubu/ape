@@ -11,6 +11,7 @@ from eth_pydantic_types import HexBytes
 from eth_utils import to_hex
 from ethpm_types.abi import EventABI
 
+from ape.api.accounts import AccountAPI
 from ape.api.address import Address, BaseAddress
 from ape.api.query import (
     ContractCreation,
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from pandas import DataFrame
 
     from ape.api.networks import ProxyInfoAPI
+    from ape.api.providers import CallResult
     from ape.api.transactions import ReceiptAPI, TransactionAPI
     from ape.types.address import AddressType
 
@@ -122,25 +124,42 @@ class ContractCall(ManagerAccessMixin):
         decode_output = kwargs.pop("decode", True)
         txn = self.serialize_transaction(*args, **kwargs)
         txn.chain_id = self.provider.network.chain_id
-        raw_output = self.provider.send_call(txn, **kwargs)
+
+        result = self.provider.send_call(txn, **kwargs)
+
+        # If the result is raw bytes, handle it directly.
+        if isinstance(result, HexBytes):
+            return self._decode_returndata(result) if decode_output else result
+
+        # At this point, result must be a CallResult.
+        # Note: type hinting here is for clarity only.
+        call_result: CallResult = result  # type: ignore
 
         if not decode_output:
-            return raw_output
+            return call_result.returndata
 
+        elif call_result.revert:
+            return call_result.revert.revert_message
+
+        return call_result.decode(self.abi)
+
+    def _decode_returndata(self, returndata: HexBytes) -> Any:
+        # The current and main way of decoding call-results (HexBytes) before
+        # the wider adoption of the `CallResult` class.
         # Decode the output bytes into Python types.
-        output = self.provider.network.ecosystem.decode_returndata(
+        decoded_output = self.provider.network.ecosystem.decode_returndata(
             self.abi,
-            raw_output,
+            returndata,
         )
 
-        if not isinstance(output, (list, tuple)):
-            return output
+        if not isinstance(decoded_output, (list, tuple)):
+            return decoded_output
 
         # NOTE: Returns a tuple, so make sure to handle all the cases
-        elif len(output) < 2:
-            return output[0] if len(output) == 1 else None
+        elif len(decoded_output) < 2:
+            return decoded_output[0] if len(decoded_output) == 1 else None
 
-        return output
+        return decoded_output
 
 
 class ContractMethodHandler(ManagerAccessMixin):
@@ -297,12 +316,20 @@ class ContractCallHandler(ContractMethodHandler):
         """
         return self.transact.as_transaction(*args, **kwargs)
 
+    def as_transaction_bytes(self, *args, **txn_kwargs) -> HexBytes:
+        """
+        Get a signed serialized transaction.
+
+        Returns:
+            HexBytes: The serialized transaction
+        """
+        return self.transact.as_transaction_bytes(**txn_kwargs)
+
     @property
     def transact(self) -> "ContractTransactionHandler":
         """
         Send the call as a transaction.
         """
-
         return ContractTransactionHandler(self.contract, self.abis)
 
     def estimate_gas_cost(self, *args, **kwargs) -> int:
@@ -391,11 +418,28 @@ class ContractTransactionHandler(ContractMethodHandler):
         Returns:
             :class:`~ape.api.transactions.TransactionAPI`
         """
-
+        sign = kwargs.pop("sign", False)
         contract_transaction = self._as_transaction(*args)
         transaction = contract_transaction.serialize_transaction(*args, **kwargs)
         self.provider.prepare_transaction(transaction)
+
+        if sender := kwargs.get("sender"):
+            if isinstance(sender, AccountAPI):
+                prepped_tx = sender.prepare_transaction(transaction)
+                return (sender.sign_transaction(prepped_tx) or prepped_tx) if sign else prepped_tx
+
         return transaction
+
+    def as_transaction_bytes(self, *args, **txn_kwargs) -> HexBytes:
+        """
+        Get a signed serialized transaction.
+
+        Returns:
+            HexBytes: The serialized transaction
+        """
+        txn_kwargs["sign"] = True
+        tx = self.as_transaction(*args, **txn_kwargs)
+        return tx.serialize_transaction()
 
     def estimate_gas_cost(self, *args, **kwargs) -> int:
         """
@@ -930,7 +974,7 @@ class ContractTypeWrapper(ManagerAccessMixin):
     def source_path(self) -> Optional[Path]:
         """
         Returns the path to the local contract if determined that this container
-        belongs to the active project by cross checking source_id.
+        belongs to the active project by cross-checking source_id.
         """
         if not (source_id := self.contract_type.source_id):
             return None
@@ -1136,7 +1180,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
             }
         except Exception as err:
             # NOTE: Must raise AttributeError for __attr__ method or will seg fault
-            raise ApeAttributeError(str(err)) from err
+            raise ApeAttributeError(str(err), base_err=err) from err
 
     @cached_property
     def _mutable_methods_(self) -> dict[str, ContractTransactionHandler]:
@@ -1155,7 +1199,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
             }
         except Exception as err:
             # NOTE: Must raise AttributeError for __attr__ method or will seg fault
-            raise ApeAttributeError(str(err)) from err
+            raise ApeAttributeError(str(err), base_err=err) from err
 
     def call_view_method(self, method_name: str, *args, **kwargs) -> Any:
         """
@@ -1295,7 +1339,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
             }
         except Exception as err:
             # NOTE: Must raise AttributeError for __attr__ method or will seg fault
-            raise ApeAttributeError(str(err)) from err
+            raise ApeAttributeError(str(err), base_err=err) from err
 
     @cached_property
     def _errors_(self) -> dict[str, list[type[CustomError]]]:
@@ -1337,7 +1381,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
         except Exception as err:
             # NOTE: Must raise AttributeError for __attr__ method or will seg fault
-            raise ApeAttributeError(str(err)) from err
+            raise ApeAttributeError(str(err), base_err=err) from err
 
     def __dir__(self) -> list[str]:
         """
@@ -1537,6 +1581,9 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
             txn_hash (Union[str, HexBytes]): The hash of the transaction that deployed the
               contract, if available. Defaults to ``None``.
             fetch_from_explorer (bool): Set to ``False`` to avoid fetching from an explorer.
+            proxy_info (:class:`~ape.api.networks.ProxyInfoAPI` | None): Proxy info object to set
+              to avoid detection; defaults to ``None`` which will detect it if ``detect_proxy=True``.
+            detect_proxy (bool): Set to ``False`` to avoid detecting missing proxy info.
 
         Returns:
             :class:`~ape.contracts.ContractInstance`
