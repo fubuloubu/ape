@@ -1,6 +1,7 @@
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from functools import cached_property, partial, singledispatchmethod
 from statistics import mean, median
 from typing import IO, TYPE_CHECKING, Optional, Union, cast
@@ -800,6 +801,44 @@ class ChainManager(BaseManager):
     @pending_timestamp.setter
     def pending_timestamp(self, new_value: Union[int, str]):
         self.provider.set_timestamp(self.conversion_manager.convert(new_value, int))
+
+    def get_block_at(self, time: datetime | int) -> "BlockAPI":
+        """
+        Search for a block closest to time ``time``.
+
+        ```{important}
+        This method returns the closet block at or after ``time``.
+        ```
+
+        Args:
+            time: (datetime | int): Time of block to search for.
+
+        Returns:
+            (~:class:`BlockAPI`): The block closest to ``time`` without being before it.
+        """
+
+        if isinstance(time, int):
+            time = datetime.fromtimestamp(time)
+
+        now = datetime.now(timezone.utc)
+        # NOTE: This is only an estimate of the block time, used for the algorithm
+        block_time_secs = self.network_manager.network.block_time or 1
+
+        est_blocks = int((now - time).total_seconds() / block_time_secs)
+        block = self.blocks[-est_blocks]
+
+        # NOTE: Ordering here favors having a block with `.datetime` that is after `time`
+        while time < (prev_block := self.blocks[block.number - 1]).datetime:
+            est_blocks = int((prev_block.datetime - time).total_seconds() / block_time_secs)
+            # NOTE: Because we are using 1 prior, we should avoid getting stuck here
+            block = self.blocks[prev_block.number - est_blocks]
+
+        while time > (next_block := self.blocks[block.number + 1]).datetime:
+            est_blocks = int((time - next_block.datetime).total_seconds() / block_time_secs)
+            # NOTE: Because we are using 1 after, we should avoid getting stuck here
+            block = self.blocks[next_block.number + est_blocks]
+
+        return block
 
     @log_instead_of_fail(default="<ChainManager>")
     def __repr__(self) -> str:
