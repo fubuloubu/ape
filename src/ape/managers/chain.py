@@ -927,7 +927,7 @@ class ChainManager(BaseManager):
         try:
             snapshot = self.snapshot()
         except APINotImplementedError:
-            logger.error("Failed to create snapsho: Provider does not support snapshotting.")
+            logger.error("Failed to create snapshot: Provider does not support snapshotting.")
             snapshot = None
 
         pending = self.pending_timestamp
@@ -936,10 +936,13 @@ class ChainManager(BaseManager):
         start_network_name = self.provider.network.name
         start_provider_name = self.provider.name
 
+        error: Exception | None = None
+
         try:
             yield
-        except Exception:
-            pass  # NOTE: Handle cleanup after any exceptions in yielded context
+        except Exception as err:
+            # NOTE: Handle cleanup before raising any exceptions from yielded context
+            error = err
 
         if snapshot is None:
             return
@@ -963,6 +966,9 @@ class ChainManager(BaseManager):
         except APINotImplementedError:
             # Provider does not support time travel.
             pass
+
+        if error:
+            raise error
 
     def mine(
         self,
